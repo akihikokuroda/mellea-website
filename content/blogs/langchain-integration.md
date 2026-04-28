@@ -69,53 +69,138 @@ result = validated_chain.invoke(
 print(result.content)
 ```
 
-## Core Pattern: Instruct-Validate-Repair
+## The Problem: Validation in LangChain Chains
 
-Mellea adds **generative programming patterns** that treat LLM generation as a structured programming problem:
+Most LangChain applications follow this pattern:
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+
+model = ChatOpenAI()
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful assistant"),
+    ("human", "{query}")
+])
+
+chain = prompt | model
+result = chain.invoke({"query": "Write a product review"})
+print(result.content)  # May or may not meet quality standards
+```
+
+The problem: **LangChain generates once and returns whatever it gets.** Common pain points:
+
+- **Manual validation**: You manually check if the output is good, then retry if it isn't
+- **Scattered validation logic**: Format checks, semantic validation, and retries are scattered across your code
+- **No retry mechanism**: If validation fails, you restart from scratch with no feedback
+- **Debugging failures**: It's hard to know why validation failed or how close you were
+
+If you want reliable outputs, you end up writing retry logic like this:
+
+```python
+max_attempts = 5
+for attempt in range(max_attempts):
+    result = chain.invoke({"query": "Write a professional email"})
+    
+    # Manual validation checks
+    word_count = len(result.content.split())
+    is_professional = "Dear" in result.content
+    has_closing = "Sincerely" in result.content
+    
+    if 50 < word_count < 300 and is_professional and has_closing:
+        break  # Success
+    # Otherwise retry
+else:
+    print("Failed after max attempts")
+```
+
+This approach doesn't scale. Each new validation rule requires code changes, and debugging is tedious.
+
+## The Baseline: LangChain + Third-Party Guardrails
+
+Many projects try the **Guardrails AI library** for validation:
+
+```python
+from guardrails import Guard
+from langchain_core.prompts import ChatPromptTemplate
+
+# Define guardrails
+guardrail = Guard.from_rail_string("""
+<rail version="0.1">
+<output>
+    <string name="response"
+            validators="length: 50 300"
+            on-fail="reask"/>
+</output>
+</rail>
+""")
+
+chain = prompt | model
+result = chain.invoke({"query": "Write a professional email"})
+validated = guardrail.validate(result.content)
+
+if not validated.passed:
+    # Manual retry
+    result = chain.invoke({"query": "Write a professional email"})
+```
+
+This helps with **rule-based validation** (length, format, regex) but has limits:
+
+- **Validation is external** — separate from generation, so retries lose context
+- **No semantic checks** — can't validate tone, professionalism, or intent
+- **Manual retries** — you still write retry logic for each use case
+- **Limited feedback** — you see pass/fail, but not why or how to fix
+
+For better output quality, you need a system that validates *during* generation with smart retry strategies.
+
+## How Mellea Addresses This
+
+Mellea integrates validation directly into the generation process. See the [Mellea docs](https://docs.mellea.ai/) for core concepts like the instruct-validate-repair pattern and requirements system. Here's what this means in practice:
 
 ### Automatic Validation and Retry
+
+Instead of manual retry logic, Mellea automatically tries until requirements are met:
 
 ```python
 from mellea import start_session
 from mellea_langchain import MelleaChatModel
 from mellea.stdlib.requirements import req
 from mellea.stdlib.sampling import RejectionSamplingStrategy
-from langchain_core.messages import HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
 
 # Create Mellea-powered LangChain model
 m = start_session()
 chat_model = MelleaChatModel(mellea_session=m)
 
-# Define explicit requirements
-response = chat_model.invoke(
-    [HumanMessage(content="Write a formal business email")],
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful assistant"),
+    ("human", "{query}")
+])
+
+# Attach requirements using bind()
+model_with_requirements = chat_model.bind(
     model_options={
         "requirements": [
-            req("Must include a professional greeting"),
-            req("Must be concise (under 200 words)"),
-            req("Must include a clear call to action"),
+            req("Must be professional and helpful"),
+            req("Must be between 50-300 words", 
+                validation_fn=simple_validate(lambda x: 50 < len(x.split()) < 300)),
+            req("Must include a greeting",
+                validation_fn=simple_validate(lambda x: "Dear" in x)),
         ],
         "strategy": RejectionSamplingStrategy(loop_budget=5),
-        "return_sampling_results": True,
     }
 )
 
-# Mellea automatically validates and retries until requirements are met
-print(f"Content: {response.content}")
+chain = prompt | model_with_requirements
+result = chain.invoke({"query": "Write a professional email"})
+# Retried up to 5 times automatically; guaranteed to meet requirements
 ```
 
-Here's what happens:
-
-1. Generates an output
-2. Validates it against your requirements using LLM-as-a-judge
-3. If validation fails, automatically retries with feedback
-4. Returns the first valid output or the best attempt within the loop budget
-
-LangChain generates once and returns whatever it gets. Mellea keeps trying until the output is valid.
+That's it—no manual retry logic. Mellea validates and retries automatically with clear feedback.
 
 ### Sampling Strategies for Inference-Time Scaling
 
-You can choose how aggressive the retry logic is. Each strategy trades more API calls for better output quality. Pass the strategy along with requirements in `model_options`:
+You can choose how aggressive the retry logic is. Each strategy trades more API calls for better output quality:
 
 ```python
 from mellea.stdlib.sampling import (
@@ -126,7 +211,6 @@ from mellea.stdlib.sampling import (
 from mellea.stdlib.requirements import req
 
 # Rejection Sampling: Keep trying until requirements are met (up to loop_budget)
-# Cost: Up to N LLM calls + N validation calls
 response = chat_model.invoke(
     messages,
     model_options={
@@ -135,8 +219,7 @@ response = chat_model.invoke(
     }
 )
 
-# Multi-Turn Strategy: Agentic multi-turn repair with conversation
-# Cost: Multiple LLM calls with conversational context
+# Multi-Turn Strategy: Agentic repair with conversation
 response = chat_model.invoke(
     messages,
     model_options={
@@ -146,7 +229,6 @@ response = chat_model.invoke(
 )
 
 # Repair Template Strategy: Adds repair instructions to failed attempts
-# Cost: Up to N LLM calls with repair context
 response = chat_model.invoke(
     messages,
     model_options={
@@ -156,36 +238,31 @@ response = chat_model.invoke(
 )
 ```
 
-Each strategy uses more inference to improve quality. LangChain doesn't have a built-in equivalent. The tradeoff: more API calls and latency for better output.
+LangChain has no equivalent. Mellea lets you trade compute for quality using proven sampling strategies.
 
-### Requirements as Composable Objects
+### Semantic + Deterministic Validation
 
-Requirements in Mellea are structured and reusable, not scattered in prompt text:
+Combine fast checks with semantic validation:
 
 ```python
 from mellea.stdlib.requirements import req, check, simple_validate
-from langchain_core.messages import HumanMessage
 
-# LLM-validated requirements (semantic, slower but flexible)
+# LLM-validated semantic checks (slower but flexible)
 semantic_requirements = [
     req("The email should be professional"),
     req("The tone should be friendly but formal"),
-    check("Do not mention pricing"),
 ]
 
-# Deterministic requirements (fast, no LLM call needed)
+# Deterministic checks (fast, < 1ms, no LLM call)
 deterministic_requirements = [
     req("Under 200 words", validation_fn=simple_validate(lambda x: len(x.split()) < 200)),
     req("Must include email address", validation_fn=simple_validate(lambda x: "@" in x)),
-    req("Must start with 'Dear'", validation_fn=simple_validate(lambda x: x.startswith("Dear"))),
 ]
 
-# Combine both types for comprehensive validation
 all_requirements = semantic_requirements + deterministic_requirements
 
-# Generate with validation
 response = chat_model.invoke(
-    [HumanMessage(content="Write a business email to the sales team about a product launch. Include a contact email.")],
+    messages,
     model_options={
         "requirements": all_requirements,
         "strategy": RejectionSamplingStrategy(loop_budget=5),
@@ -193,59 +270,19 @@ response = chat_model.invoke(
 )
 ```
 
-You get both speed (deterministic checks < 1ms) and flexibility (LLM-based semantic validation).
+You get both speed (deterministic checks) and power (semantic validation). See the [Mellea Meets AI Frameworks](./agentic-framework-integrations.md) post for details on `req()` vs `check()`.
 
-**Note on `req()` vs `check()`:**
+## Pain Point 1: Manual Validation and Retry Logic
 
-- `req()` includes the requirement in the instruction prompt so the model sees it upfront and actively targets it
-- `check()` excludes the requirement from the instruction prompt but still validates it after generation
+**Problem:** Validation logic is scattered, hard to maintain, and retries lose context.
 
-Use `req()` for things the model should actively target (e.g., "Must cite sources"). Use `check()` for constraints you want to verify without shaping the initial generation (e.g., "Avoid speculation"). Note: `check()` requirements still appear in repair instructions if validation fails and retries are triggered. For more details, see the [Mellea Meets AI Frameworks](./agentic-framework-integrations.md) post.
-
-## What This Integration Enables
-
-### Guaranteed Output Quality
-
-Most LangChain chains generate once and return whatever they get. With Mellea, the output keeps being regenerated until it meets your requirements:
-
-```python
-from langchain_core.prompts import ChatPromptTemplate
-
-# Standard LangChain (no validation)
-standard_chain = prompt | standard_langchain_model
-result = standard_chain.invoke({"topic": "AI"})
-# May or may not meet your requirements
-
-# With Mellea (validated)
-# Use bind() to attach requirements before building the chain
-model_with_requirements = chat_model.bind(
-    model_options={
-        "requirements": [
-            req("Must be well-structured with clear sections"),
-            req("Must include specific examples"),
-            req("Must be between 300-500 words",
-                validation_fn=simple_validate(lambda x: 300 <= len(x.split()) <= 500)),
-        ],
-        "strategy": RejectionSamplingStrategy(loop_budget=5),
-    }
-)
-mellea_chain = prompt | model_with_requirements
-result = mellea_chain.invoke({"topic": "AI"})
-# Meets requirements or returns the best attempt with validation feedback
-```
-
-The cost: up to 5x latency and higher API usage. Use when quality beats speed.
-
-### Reusable Requirements
-
-Instead of validation logic scattered across your code, define requirements once and reuse them:
+**Solution:** Mellea integrates validation into generation. Define requirements once and reuse them:
 
 ```python
 # Define reusable requirement sets
-professional_email_requirements = [
+professional_requirements = [
     req("Must have a professional greeting"),
     req("Must be formal in tone"),
-    req("Must include a clear subject line"),
 ]
 
 concise_requirements = [
@@ -253,10 +290,10 @@ concise_requirements = [
     req("At least 50 words", validation_fn=simple_validate(lambda x: len(x.split()) > 50)),
 ]
 
-# Compose them
-email_requirements = professional_email_requirements + concise_requirements
+# Compose once, reuse everywhere
+email_requirements = professional_requirements + concise_requirements
 
-# Use bind() to attach requirements before building chains
+# Attach to model before building chain
 model_with_requirements = chat_model.bind(
     model_options={
         "requirements": email_requirements,
@@ -264,63 +301,94 @@ model_with_requirements = chat_model.bind(
     }
 )
 
-# Build and use chains
+# Use in multiple chains
 customer_email_chain = prompt1 | model_with_requirements
 result1 = customer_email_chain.invoke({"customer": "John", "issue": "billing"})
 
 internal_email_chain = prompt2 | model_with_requirements
 result2 = internal_email_chain.invoke({"topic": "quarterly review"})
+# Both automatically retry with the same requirements
 ```
 
-### Validation Transparency
+**Benefit:** No manual retry code. Add new requirements in one place; they apply everywhere.
 
-When validation fails, see why it failed and how many attempts were made:
+## Pain Point 2: Rule-Based Validation is Too Limited
+
+**Problem:** Third-party guardrails (like Guardrails AI) only validate after generation using rules. They can't check tone, intent, or semantic quality.
+
+**Solution:** Mellea validates during generation using the LLM as a judge. Mix semantic + deterministic checks:
+
+```python
+# LLM-based semantic validation (powerful but costs API calls)
+semantic = [
+    req("Must be professional and empathetic"),
+    req("Must directly address the customer's issue"),
+]
+
+# Deterministic checks (fast, < 1ms, no LLM)
+deterministic = [
+    req("Must include a closing", 
+        validation_fn=simple_validate(lambda x: "Sincerely" in x or "Best regards" in x)),
+]
+
+# Use both together
+model_with_validation = chat_model.bind(
+    model_options={
+        "requirements": semantic + deterministic,
+        "strategy": RejectionSamplingStrategy(loop_budget=5),
+    }
+)
+
+chain = prompt | model_with_validation
+result = chain.invoke({"issue": "payment failed"})
+```
+
+**Benefit:** Validate quality (semantic) + format (rules) in one pass. Better outputs, not just format-compliant ones.
+
+## Pain Point 3: No Debugging or Transparency
+
+**Problem:** When validation fails, you don't know why or how close you were.
+
+**Solution:** Mellea gives detailed feedback at each attempt:
 
 ```python
 response = chat_model.invoke(
-    [HumanMessage(content="Write a brief statement about technology")],
+    messages,
     model_options={
         "requirements": [
             req("Must be exactly 3 sentences"),
             req("Must mention 'quantum computing'"),
-            req("Must be under 50 words", validation_fn=simple_validate(lambda x: len(x.split()) < 50)),
+            req("Under 50 words", validation_fn=simple_validate(lambda x: len(x.split()) < 50)),
         ],
         "strategy": RejectionSamplingStrategy(loop_budget=5),
         "return_sampling_results": True,
     }
 )
 
-# During generation, you'll see detailed feedback:
-# 0%|          | 0/5 [00:00<?, ?it/s] FAILED. Valid: 2/3. Failed:
+# During generation, you see:
+# ATTEMPT 1: FAILED. Valid: 2/3 requirements. Failed:
 #     - Must be exactly 3 sentences
-# 20%|██        | 1/5 [00:00<00:03,  1.10it/s] FAILED. Valid: 2/3. Failed:
+# ATTEMPT 2: FAILED. Valid: 2/3 requirements. Failed:
 #     - Must be exactly 3 sentences
 # ...
-# After 5 attempts, it selects the best result
-
-# The response is a standard LangChain AIMessage
-print(f"Content: {response.content}")
+# BEST RESULT selected after 5 attempts
 ```
 
-This transparency provides detailed feedback during validation:
+**Benefit:** Know which requirements pass/fail and refine your prompts based on real data.
 
-- Progress bar indicating validation attempts (0-100%)
-- Which specific requirements failed at each attempt
-- How many requirements passed vs. failed
-- When the best attempt is selected after exhausting retries
+## Pain Point 4: Writing Validation Functions is Tedious
 
-### Generative Functions
+**Problem:** Validation often requires writing special-purpose code. In LangChain, you might write tools or parsers for validation.
 
-Mellea's `@generative` decorator defines AI-generated functions without implementation:
+**Solution:** Use Mellea's `@generative` decorator for one-off generated behavior:
 
 ```python
 from mellea import start_session, generative
 from typing import Literal
 
-# Create session
 m = start_session()
 
-# Define a generative function - no implementation needed!
+# Instead of writing a validation function, declare what it should do
 @generative
 def classify_sentiment(text: str) -> Literal["positive", "negative", "neutral"]:
     """Classify the sentiment of the input text."""
@@ -329,7 +397,7 @@ def classify_sentiment(text: str) -> Literal["positive", "negative", "neutral"]:
 sentiment = classify_sentiment(m, text="I love this product!")
 print(sentiment)  # Output: positive
 
-# Another example
+# Another example: email categorization
 @generative
 def categorize_email(subject: str, body: str) -> Literal["urgent", "normal", "spam"]:
     """Categorize an email based on its subject and body."""
@@ -341,336 +409,111 @@ category = categorize_email(m,
 print(category)  # Output: urgent
 ```
 
-Instead of writing a classifier, you declare what it should do (via the function signature and docstring) and let Mellea generate the behavior. The type hints constrain the output to valid values.
+**When to use `@generative` vs. LangChain tools:**
 
-## Real-World Patterns
+- Use `@generative` for **one-off generated behavior** (classification, extraction, formatting)
+- Use **LangChain tools** for complex **multi-step workflows** where you need tool calling and agent loops
 
-### Validated Output Parsing
-
-Most LangChain chains parse without validation. Add Mellea validation before parsing to catch format issues early:
-
-```python
-# Use bind() to attach validation requirements
-model_with_validation = chat_model.bind(
-    model_options={
-        "requirements": [req("Must be valid JSON"), req("Must include all fields")],
-        "strategy": RejectionSamplingStrategy(loop_budget=3),
-    }
-)
-
-chain = prompt | model_with_validation
-result = chain.invoke(input)
-
-# Now parse the validated output
-parsed = output_parser.parse(result.content)
-```
-
-### Validated Tool Calls
-
-Agents often produce malformed tool calls. Validate them before execution:
+Example: Instead of defining a tool, use `@generative`:
 
 ```python
-# Agent outputs are validated
-mellea_model = MelleaChatModel(
-    mellea_session=m,
-    requirements=[
-        req("Tool calls must be properly formatted"),
-        req("Must provide reasoning for tool selection"),
-    ]
-)
-agent = create_tool_calling_agent(llm=mellea_model, tools=tools)
-result = agent_executor.invoke({"input": query})
+# Without Mellea (LangChain tool)
+from langchain_core.tools import tool
+
+@tool
+def validate_email_format(email: str) -> str:
+    """Validate if email has a professional greeting."""
+    # You implement this...
+    if email.startswith("Dear"):
+        return "valid"
+    return "invalid"
+
+# With Mellea (@generative)
+@generative
+def check_email_format(email: str) -> Literal["valid", "invalid"]:
+    """Check if email has a professional greeting and sign-off."""
+
+result = check_email_format(m, email="Dear John, ... Best regards, Alice")
+# Output: valid
 ```
 
-### Validation + Parsing
+**Benefit:** Less boilerplate. Let the LLM define behavior via docstrings and type hints.
 
-Combine semantic validation with deterministic parsing:
+## Comparing Approaches
 
-```python
-# Validate before parsing
-import json
+### Side-by-Side: Manual Retry vs. Guardrails vs. Mellea
 
-# Define validation functions
-def is_json(text: str) -> bool:
-    """Must be JSON."""
-    try:
-        json.loads(text)
-        return True
-    except (json.JSONDecodeError, ValueError):
-        return False
+Here's a comparison of three approaches to validation in LangChain:
 
-def has_name_field(text: str) -> bool:
-    """Must include 'name' field."""
-    return "name" in text.lower()
+| Aspect | Manual Retry | Third-Party Guardrails | Mellea |
+| --- | --- | --- | --- |
+| **Setup** | Write retry loop | Configure rules | Define requirements, attach to model |
+| **Validation Type** | Custom code | Rules (PII, length, regex) | Semantic (LLM) + deterministic |
+| **Timing** | After generation | After generation | During generation with automatic retry |
+| **Retry Logic** | Manual (you write it) | Manual (you write it) | Automatic (built-in strategies) |
+| **Feedback** | Generic/none | Pass/fail + errors | Detailed results per attempt |
+| **Reusability** | Low (scattered code) | Low (per-chain configs) | High (Python objects, composable) |
+| **Latency Overhead** | Variable | Minimal | 2-5x (due to retries) |
+| **When to Use** | Simple cases | PII/toxicity detection | Quality-critical, need semantic checks |
 
-# Use bind() to attach semantic validation
-model_with_validation = chat_model.bind(
-    model_options={
-        "requirements": [req("Must output valid JSON")],
-        "strategy": RejectionSamplingStrategy(loop_budget=3),
-    }
-)
+### Example: Same Use Case, Three Approaches
 
-chain = prompt | model_with_validation
-result = chain.invoke(input)
-
-# Deterministic post-validation
-if is_json(result.content) and has_name_field(result.content):
-    parsed = json.loads(result.content)
-    # Use parsed data
-else:
-    # Handle validation failure
-    pass
-```
-
-## Example: Customer Support Email
-
-Without Mellea, you retry manually when the output fails checks:
+**LangChain with manual retry:**
 
 ```python
 chain = prompt | model
-email = chain.invoke({"customer": "John", "issue": "billing"})
+max_attempts = 5
 
-if len(email.split()) > 300:
-    email = chain.invoke({"customer": "John", "issue": "billing", "length": "short"})
-if "Dear" not in email:
-    email = chain.invoke({"customer": "John", "issue": "billing", "greeting": "required"})
-# Still might not meet all requirements
+for attempt in range(max_attempts):
+    result = chain.invoke({"issue": "billing problem"})
+    word_count = len(result.content.split())
+    is_professional = "Dear" in result.content
+    
+    if 50 < word_count < 300 and is_professional:
+        break
 ```
 
-With Mellea, define what you need and let it retry automatically:
+**LangChain + third-party guardrails:**
 
 ```python
-# Use bind() to attach requirements
-model_with_requirements = chat_model.bind(
+guardrails = Guard.from_rail_string("""
+<rail version="0.1">
+<output>
+    <string name="response" validators="length: 50 300" on-fail="reask"/>
+</output>
+</rail>
+""")
+
+chain = prompt | model
+result = chain.invoke({"issue": "billing problem"})
+validated = guardrails.validate(result.content)
+if not validated.passed:
+    result = chain.invoke({"issue": "billing problem"})
+```
+
+**Mellea:**
+
+```python
+model_with_validation = chat_model.bind(
     model_options={
         "requirements": [
-            req("Must have a professional greeting"),
-            req("Must address the specific issue"),
-            req("Must be empathetic and helpful"),
-            req("Under 300 words", validation_fn=simple_validate(lambda x: len(x.split()) < 300)),
-            req("Must include greeting", validation_fn=simple_validate(lambda x: "Dear" in x)),
+            req("Must be professional"),
+            req("50-300 words", validation_fn=simple_validate(lambda x: 50 < len(x.split()) < 300)),
         ],
         "strategy": RejectionSamplingStrategy(loop_budget=5),
     }
 )
 
-chain = prompt | model_with_requirements
-email = chain.invoke({"customer": "John", "issue": "billing"})
-# Retried up to 5 times automatically
+chain = prompt | model_with_validation
+result = chain.invoke({"issue": "billing problem"})
+# Automatically retried up to 5 times with semantic + deterministic checks
 ```
 
-## Feature Comparison
+**Winner for:** Mellea for reusability and semantic validation; guardrails for minimal overhead; manual retry for simple one-off cases.
 
-| Feature | LangChain | Mellea |
-| --- | --- | --- |
-| Output Validation | Manual, external | Automatic, built-in |
-| Retry Logic | You write it | Sampling strategies included |
-| Requirements | In prompts | Reusable Python objects |
-| Validation Feedback | None | Detailed results per attempt |
-| Inference-Time Scaling | No | Rejection, MultiTurn, Repair strategies |
-| Generative Functions | No | `@generative` decorator |
-| Semantic Validation | No | LLM-as-a-judge |
-| Fast Checks | No | `simple_validate()` with no LLM calls |
+## Combining Mellea with Third-Party Guardrails
 
-## Mellea vs. Third-Party Guardrails
-
-LangChain itself does not ship a built-in guardrails component. However, you can integrate third-party guardrails libraries (like Guardrails AI) with LangChain. These validate output after generation.
-
-### Third-Party Guardrails Integration
-
-To use third-party guardrails with LangChain, you integrate external validation services. Here's an example using the Guardrails AI library:
-
-Example:
-
-```python
-# Third-party guardrails (e.g., Guardrails AI)
-from guardrails import Guard
-from langchain_core.prompts import ChatPromptTemplate
-
-# Define guardrails using Guardrails AI
-guardrails = Guard.from_rail_string("""
-<rail version="0.1">
-<output>
-    <string name="response"
-            validators="length: 0 500"
-            on-fail="reask"/>
-</output>
-</rail>
-""")
-
-# Chain with post-generation validation
-chain = prompt | model
-result = chain.invoke({"input": "..."})
-validated = guardrails.validate(result.content)
-```
-
-### How Mellea Differs
-
-Instead of validating after generation, Mellea validates during generation and retries if needed:
-
-| Aspect | Third-Party Guardrails | Mellea |
-| --- | --- | --- |
-| Philosophy | Validate after generation | Validate during; retry if needed |
-| Timing | After generation only | During generation with automatic retry |
-| Validation | External services + rules | LLM or deterministic checks |
-| Retry | You write it | Built-in strategies |
-| Requirements | Configuration DSL | Python objects |
-| Reusability | Limited | Composable with `&` |
-| Semantic Validation | Requires external API | Built-in |
-| Fast Checks | Rules only | `simple_validate()` functions |
-| **Integration** | Separate component | Integrated into model generation |
-
-### Key Differences Explained
-
-#### Validation Timing and Retry
-
-Third-party guardrails generate first, then validate. You handle retries manually:
-
-```python
-chain = prompt | model
-result = chain.invoke(input)
-validated = guardrails.validate(result.content)
-if not validated.passed:
-    result = chain.invoke(input)  # Manual retry
-```
-
-Mellea validates and retries automatically during generation:
-
-```python
-chain = prompt | chat_model
-result = chain.invoke(
-    input,
-    model_options={
-        "requirements": [req("Must be professional")],
-        "strategy": RejectionSamplingStrategy(loop_budget=5),
-    }
-)  # Retries up to 5 times automatically
-```
-
-Tradeoff: Mellea is slower but guarantees the output meets requirements. LangChain is faster but requires manual retry logic.
-
-#### Semantic vs. Rule-Based Validation
-
-Third-party guardrails use rules and external services:
-
-```python
-guardrails = Guard.from_validators([
-    LengthValidator(min=50, max=500),
-    RegexValidator(pattern=r"^Dear.*"),
-    ToxicityValidator(threshold=0.8),
-])
-```
-
-Mellea mixes semantic (LLM-based) with deterministic checks:
-
-```python
-requirements = [
-    req("Must be professional and empathetic"),
-    req("Must address the concern"),
-    req("Under 500 words", validation_fn=simple_validate(lambda x: len(x.split()) < 500)),
-    req("Starts with greeting", validation_fn=simple_validate(lambda x: x.startswith("Dear"))),
-]
-```
-
-Tradeoff: LangChain's rules are fast but limited. Mellea's semantic checks are powerful but cost extra API calls.
-
-#### Composability and Reusability
-
-Third-party guardrails are typically per-chain:
-
-```python
-chain1 = prompt1 | model
-result1 = chain1.invoke(input)
-validated1 = guardrails1.validate(result1.content)
-
-chain2 = prompt2 | model
-result2 = chain2.invoke(input)
-validated2 = guardrails2.validate(result2.content)
-```
-
-Mellea requirements are reusable Python lists:
-
-```python
-professional_reqs = [req("Professional tone"), req("Clear structure")]
-length_reqs = [req("50-500 words", validation_fn=simple_validate(lambda x: 50 < len(x.split()) < 500))]
-
-email_chain = prompt1 | chat_model
-email_result = email_chain.invoke(
-    input,
-    model_options={"requirements": professional_reqs + length_reqs}
-)
-
-report_chain = prompt2 | chat_model
-report_result = report_chain.invoke(
-    input,
-    model_options={"requirements": professional_reqs + length_reqs}
-)
-```
-
-You can also compose guardrails with the `&` operator:
-
-```python
-# MelleaGuardrail expects callable functions
-def is_professional(text: str) -> bool:
-    """Check if text is professional."""
-    return len(text) > 20
-
-def is_proper_length(text: str) -> bool:
-    """Check if text is 50-500 words."""
-    return 50 < len(text.split()) < 500
-
-guardrail1 = MelleaGuardrail(requirements=[is_professional], name="professional")
-guardrail2 = MelleaGuardrail(requirements=[is_proper_length], name="length")
-combined = guardrail1 & guardrail2
-```
-
-Tradeoff: Mellea requires more setup but pays off with reuse and maintainability.
-
-#### Validation Feedback
-
-Third-party guardrails give validation results after generation:
-
-```python
-result = chain.invoke(input)
-validated = guardrails.validate(result.content)
-if not validated.passed:
-    print(f"Validation failed: {validated.errors}")
-```
-
-Mellea provides detailed results per attempt during generation:
-
-```python
-result = guardrail.validate(text)
-print(f"Passed: {result.passed}")
-print(f"Failed requirements: {result.errors}")
-print(f"Metadata: {result.metadata}")
-# Output: Failed requirements: ['Must be professional and empathetic']
-```
-
-Tradeoff: Mellea gives more details, so you get better insight into what went wrong.
-
-### When to Use Each
-
-Use **third-party guardrails** (like Guardrails AI) if you need:
-
-- PII/toxicity detection from established services
-- Existing guardrail infrastructure (Guardrails AI, NeMo)
-- Simple rule-based validation only
-- Minimal latency overhead
-
-Use **Mellea** if you need:
-
-- Semantic validation (tone, intent, meaning)
-- Automatic retry without manual intervention
-- Quality over speed (can afford 2-5x latency)
-- Reusable validation logic
-- Inference-time scaling (compute for quality tradeoff)
-- Python applications with better ergonomics
-
-### Using Mellea with Third-Party Guardrails
-
-Combine Mellea's semantic validation with third-party guardrails for comprehensive validation:
+You can use Mellea's semantic validation alongside third-party tools for comprehensive checks:
 
 ```python
 from mellea import start_session
@@ -678,38 +521,28 @@ from mellea_langchain import MelleaChatModel, MelleaGuardrail
 from mellea.stdlib.requirements import req
 from mellea.stdlib.sampling import RejectionSamplingStrategy
 
-# Create Mellea model with semantic validation during generation
 m = start_session()
 chat_model = MelleaChatModel(mellea_session=m)
 
-# Define deterministic post-generation checks (MelleaGuardrail expects callables)
-def under_500_words(text: str) -> bool:
-    """Under 500 words."""
-    return len(text.split()) < 500
-
-def no_email_addresses(text: str) -> bool:
-    """No email addresses."""
-    return "@" not in text
-
+# Deterministic post-generation checks
 def no_sensitive_data(text: str) -> bool:
-    """No sensitive data."""
+    """Reject if contains sensitive info."""
     return not any(word in text.lower() for word in ["password", "ssn"])
 
 post_guardrail = MelleaGuardrail(
-    requirements=[under_500_words, no_email_addresses, no_sensitive_data],
-    name="post_generation_check"
+    requirements=[no_sensitive_data],
+    name="security_check"
 )
 
-# Use in chain
 chain = prompt | chat_model
 
-# Generate with semantic validation
+# Generate with semantic validation + automatic retry
 result = chain.invoke(
     {"input": "..."},
     model_options={
         "requirements": [
             req("Must be professional and helpful"),
-            req("Must address the customer's specific issue"),
+            req("Must address the customer's issue"),
         ],
         "strategy": RejectionSamplingStrategy(loop_budget=3),
     }
@@ -718,111 +551,34 @@ result = chain.invoke(
 # Apply deterministic post-checks
 validation = post_guardrail.validate(result.content)
 if not validation.passed:
-    print(f"Post-validation failed: {validation.errors}")
-    # Handle failure
+    print(f"Security check failed: {validation.errors}")
 ```
 
-This gives you semantic validation during generation + fast deterministic checks after, plus automatic retry and clear separation of concerns.
+This gives you semantic validation during generation + fast deterministic checks after.
 
-### Full Example: Customer Support Email
+## When to Use Mellea with LangChain
 
-Generate a professional email that addresses the customer's issue and meets length requirements.
+**Use Mellea if you:**
 
-**Without Mellea (LangChain):**
+- Need semantic validation (not just format checks)
+- Want to validate **during** generation with automatic retry
+- Prefer quality over speed (accept 2-5x latency for better outputs)
+- Work with structured content (emails, reports, documents)
+- Need reusable, composable validation logic
+- Have compliance or quality requirements
 
-```python
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
+**Use third-party guardrails or manual retry if you:**
 
-# Standard generation
-model = ChatOpenAI()
-prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a customer support agent. Write professional emails."),
-    ("human", "Customer issue: {issue}")
-])
+- Need minimal latency overhead (< 100ms added)
+- Only validate format or known patterns (PII, toxicity)
+- Have one-off validation that doesn't repeat
+- Use streaming endpoints (Mellea doesn't support streaming)
 
-chain = prompt | model
+**Don't use LLM-based validation for:**
 
-# Manual validation and retry
-max_attempts = 5
-for attempt in range(max_attempts):
-    result = chain.invoke({"issue": "billing problem"})
-    
-    # Manual validation
-    word_count = len(result.content.split())
-    is_professional = "Dear" in result.content
-    
-    if 50 < word_count < 300 and is_professional:
-        break  # Success
-    # Otherwise, try again
-else:
-    # Failed after max attempts
-    print("Could not generate valid email")
-```
-
-**With Mellea:**
-
-```python
-from mellea import start_session
-from mellea_langchain import MelleaChatModel
-from mellea.stdlib.requirements import req, simple_validate
-from mellea.stdlib.sampling import RejectionSamplingStrategy
-from langchain_core.prompts import ChatPromptTemplate
-
-# Create Mellea-powered model
-m = start_session()
-chat_model = MelleaChatModel(mellea_session=m)
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a customer support agent. Write professional emails."),
-    ("human", "Customer issue: {issue}")
-])
-
-# Use bind() to attach validation requirements
-model_with_requirements = chat_model.bind(
-    model_options={
-        "requirements": [
-            req("Must be professional and empathetic"),
-            req("Must directly address the billing issue"),
-            req("Must include a clear next step"),
-            req("50-300 words", validation_fn=simple_validate(lambda x: 50 < len(x.split()) < 300)),
-            req("Starts with greeting", validation_fn=simple_validate(lambda x: x.startswith("Dear"))),
-        ],
-        "strategy": RejectionSamplingStrategy(loop_budget=5),
-    }
-)
-
-# Build chain and invoke
-chain = prompt | model_with_requirements
-result = chain.invoke({"issue": "billing problem"})
-# Guaranteed to meet requirements or returns best attempt with feedback
-```
-
-The difference:
-
-- LangChain uses ~15 lines of manual retry logic. Mellea uses ~10 lines with built-in retries.
-- LangChain validates with rules. Mellea uses semantic validation (the LLM judges quality).
-- LangChain validation is scattered. Mellea validation is centralized.
-- LangChain gives generic errors. Mellea gives detailed results per attempt.
-
-In short: LangChain guardrails filter bad outputs after they're generated. Mellea guardrails generate correct outputs from the start.
-
-## When to Use This Integration
-
-**Good for:**
-
-- Production apps where quality matters more than speed
-- Structured content (emails, reports, docs with format requirements)
-- Compliance-sensitive work (regulatory or business constraints)
-- Multi-backend dev (Ollama locally, OpenAI in prod)
-- Complex validation (semantic + deterministic checks)
-
-**Not ideal for:**
-
-- Real-time chat (sub-second latency required)
-- Simple Q&A (validation overhead not justified)
-- Cost-sensitive apps with frontier models (GPT-4, Claude API costs add up). Note: Mellea with Small Language Models (SLMs) has lower costs.
-- Streaming responses (current integration returns full response as one chunk)
+- Real-time chat (users expect <500ms responses)
+- Cost-sensitive apps with expensive models (each retry costs API calls)
+- Operations where every request matters (e.g., high-volume APIs)
 
 ## Limitations
 
